@@ -22,7 +22,14 @@ flowchart LR
 ```
 
 ### 3.- Architectural drivers
-This section summarizes the drivers relevant to **Iteration 1** (initial structuring of the system).
+This section summarizes the drivers relevant to the ADD iterations captured in this document.
+
+#### Iteration drivers summary
+
+| Iteration | Goal focus | Drivers |
+|---:|---|---|
+| 1 | Initial structuring of a single `WMSInstance` and its integration boundaries | **Quality**: QA-06, QA-08. **Constraints**: C-01..C-07. **Concerns**: AC-02, AC-04 |
+| 2 | Foundation for inventory correctness (balances, statuses, reservations) | **Quality**: QA-04, QA-05. **User stories**: US-01, US-02, US-15. **Concerns**: AC-05 |
 
 #### Quality attribute scenarios
 
@@ -30,6 +37,8 @@ This section summarizes the drivers relevant to **Iteration 1** (initial structu
 | :---- | :---- | :---- |
 | QA-06 | Integration | Integrations are decoupled via stable APIs and/or event streams so new systems or instances can be added without changing core WMS code. |
 | QA-08 | Tenant isolation | Issues in one WMS instance must not impact other instances. |
+| QA-04 | Reliability / Data integrity | Inventory-affecting actions must be processed exactly once or idempotently under retries/failures so inventory and financial data remain consistent. |
+| QA-05 | Performance | Interactive inventory searches and work-queue queries must load within 1 second for 95% of requests. |
 
 #### Constraints
 
@@ -49,6 +58,7 @@ This section summarizes the drivers relevant to **Iteration 1** (initial structu
 | :---- | :---- |
 | AC-02 | Partition the system into modules/services to allow independent evolution while keeping complexity manageable. |
 | AC-04 | Support multiple instances in the cloud with strong isolation and operational simplicity. |
+| AC-05 | Ensure consistent inventory and shipment data across WMS and external systems in the presence of asynchronous messaging and failures. |
 
 ### 4.- Domain model
 The following domain model represents the **core business concepts inside a single WMS instance** (i.e., one warehouse-scoped or regional deployment with independent data and lifecycle). It focuses on the objects required to support inbound, inventory, outbound fulfillment, counting/reconciliation, and traceability, as described in `Requirements/ArchitecturalDrivers.md`.
@@ -99,6 +109,14 @@ class InventoryBalance {
   +onHandQty: decimal
   +reservedQty: decimal
   +availableQty: decimal
+}
+
+class InventoryLedgerEntry {
+  +id: UUID
+  +entryType: string
+  +qtyDelta: decimal
+  +occurredAt: datetime
+  +correlationId: string
 }
 
 class InventoryStatus {
@@ -296,6 +314,14 @@ InventoryBalance "*" --> "1" InventoryStatus : status
 InventoryBalance "1" o-- "*" InventoryReservation : reservations
 InventoryReservation "*" --> "1" ReplenishmentOrderLine : forDemand
 
+InventoryLedgerEntry "*" --> "1" Item : item
+InventoryLedgerEntry "*" --> "0..1" Location : location
+InventoryLedgerEntry "*" --> "0..1" InventoryStatus : status
+InventoryLedgerEntry "*" --> "0..1" InventoryReservation : reservationRef
+InventoryLedgerEntry "*" --> "0..1" Receipt : receiptRef
+InventoryLedgerEntry "*" --> "0..1" InventoryAdjustment : adjustmentRef
+InventoryLedgerEntry "*" --> "0..1" User : actor
+
 InboundShipment "1" o-- "*" InboundShipmentLine : lines
 InboundShipmentLine "*" --> "1" Item : item
 InboundShipment "1" --> "0..1" DockAssignment : assignedTo
@@ -352,8 +378,9 @@ IntegrationMessage "*" --> "0..1" InventoryAdjustment : inventoryMsg
 | `Item` | SKU master data required to receive, store, pick, pack, ship, count, and reconcile inventory. |
 | `UnitOfMeasure` | Defines measurement units and conversions used for receiving, picking, and shipping quantities (supports US-13 configuration). |
 | `InventoryStatus` | Business status of inventory (available, reserved, damaged, quarantined). Drives allocation eligibility and compliance (US-15, US-19). |
-| `InventoryBalance` | On-hand view of inventory for an `Item` at a `Location` with a given `InventoryStatus`. Supports fast “what do we have, where” queries (QA-05) and is the foundation for allocation and reconciliation. |
-| `InventoryReservation` | A reservation of inventory (often against `ReplenishmentOrderLine`) to prevent double-allocation and support idempotent processing (QA-04). |
+| `InventoryBalance` | Current-state view of inventory for an `Item` at a `Location` with a given `InventoryStatus`. Optimized for fast “what do we have, where” queries (QA-05). It is maintained as a projection of inventory postings. |
+| `InventoryLedgerEntry` | Append-only record of an inventory-affecting posting (receipt, reservation, release, status transfer, adjustment). Supports auditability, reconciliation, and safe replay/verification (QA-04, AC-05). |
+| `InventoryReservation` | A first-class reservation of inventory (often against `ReplenishmentOrderLine`) to prevent double-allocation and support idempotent processing under retries (QA-04). |
 | `InboundShipment` | Represents an inbound flow (supplier delivery or return). Tracks lifecycle from expected arrival to receipt completion (US-01). |
 | `InboundShipmentLine` | Line-level expectation for items/quantities in an `InboundShipment`. |
 | `Receipt` | The act of receiving and registering inbound goods. Can be partial and may produce exceptions. Updates `InventoryBalance` as inventory becomes on hand (US-01, QA-04). |
@@ -381,6 +408,22 @@ IntegrationMessage "*" --> "0..1" InventoryAdjustment : inventoryMsg
 | `Role` | Role definitions used for authorization by role and warehouse (QA-07). |
 | `ExternalSystem` | Represents integrated systems (store systems, financial system, picking systems) to support decoupled integrations (QA-06). |
 | `IntegrationMessage` | Records integration exchanges with idempotency key and status to support **exactly-once or idempotent processing** and operational visibility (QA-04, QA-09). |
+
+#### Inventory invariants and reservation lifecycle (Iteration 2)
+- **Inventory invariants**: `availableQty = onHandQty - reservedQty` and all quantities are non-negative per `Item` + `Location` + `InventoryStatus`.
+- **Reservation lifecycle**: reservations move through explicit states to support idempotency, partial processing, and safe release.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Committed
+  Committed --> Consumed
+  Committed --> Released
+  Committed --> Expired
+  Released --> [*]
+  Expired --> [*]
+  Consumed --> [*]
+```
 
 ### 5.- Container diagram
 This container view refines the **single `WMSInstance`** into deployable building blocks. It reflects the Iteration 1 strategy: **cell-based isolation per instance**, a **modular core** for the domain, and an **integration boundary** that supports decoupled APIs and event streams.
@@ -485,7 +528,7 @@ flowchart TB
 | `Outbox and event publication module` | Transactional outbox writes and publication coordination for domain and integration events. |
 
 ### 7.- Sequence diagrams
-The sequence diagrams below illustrate the **walking skeleton** interactions for Iteration 1. They focus on **decoupled integration** (QA-06) and **per-instance isolation boundaries** (QA-08) by showing how external interactions enter through the `API gateway`, are normalized by the `Integration gateway`, and are committed and published via an outbox and event bus.
+The sequence diagrams below illustrate the key interactions across iterations. Iteration 1 focuses on **decoupled integration** (QA-06) and **per-instance isolation boundaries** (QA-08). Iteration 2 refines the **inventory correctness** foundation (QA-04, AC-05) while maintaining fast operational reads (QA-05).
 
 #### Sequence 1: Store submits replenishment order
 This sequence shows a store system submitting an order through a stable API with idempotency. The integration gateway translates the request into an internal command, commits it, and emits an event via the outbox.
@@ -567,6 +610,68 @@ sequenceDiagram
   Bus-->>Finance: Financial shipment event
 ```
 
+#### Sequence 4: Receiving posts inventory with auditable ledger entry (Iteration 2)
+This sequence shows receiving as a single inventory-affecting transaction: the receipt is persisted together with an `InventoryLedgerEntry`, the `InventoryBalance` projection is updated, and an `AuditEvent` is recorded.
+
+```mermaid
+sequenceDiagram
+  participant User as Receiving operator
+  participant GW as API gateway
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  User->>GW: Register receipt
+  GW->>Core: Route to instance receiving API
+  Core->>DB: Persist receipt and receipt lines
+  Core->>DB: Append InventoryLedgerEntry for receipt posting
+  Core->>DB: Update InventoryBalance projection
+  Core->>DB: Persist AuditEvent
+  Core->>DB: Write outbox record
+  Core-->>User: Receipt accepted
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish inventory updated event
+```
+
+#### Sequence 5: Create reservation to prevent double allocation (Iteration 2)
+This sequence shows an internal reservation created against demand. The inventory module enforces invariants and records a ledger entry so retries are safe and auditable.
+
+```mermaid
+sequenceDiagram
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  Core->>DB: Validate availability for demand line
+  Core->>DB: Persist InventoryReservation state Committed
+  Core->>DB: Append InventoryLedgerEntry for reservation posting
+  Core->>DB: Update InventoryBalance reservedQty and availableQty
+  Core->>DB: Persist AuditEvent
+  Core->>DB: Write outbox record
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish reservation committed event
+```
+
+#### Sequence 6: Inventory status transfer (available to quarantined) (Iteration 2)
+This sequence shows a status change as a posting that preserves auditability and inventory correctness.
+
+```mermaid
+sequenceDiagram
+  participant User as Inventory manager
+  participant GW as API gateway
+  participant Core as WMS core
+  participant DB as WMS database
+
+  User->>GW: Change inventory status
+  GW->>Core: Route to instance inventory API
+  Core->>DB: Append InventoryLedgerEntry for status transfer
+  Core->>DB: Update InventoryBalance projection for both statuses
+  Core->>DB: Persist AuditEvent
+  Core-->>User: Status change recorded
+```
+
 ### 8.- Interfaces
 This section lists the primary interface shapes established in Iteration 1. Detailed contracts and schemas will be refined in later iterations.
 
@@ -576,9 +681,10 @@ This section lists the primary interface shapes established in Iteration 1. Deta
 | Automation integration API | REST | Versioned endpoints for pick task distribution and pick confirmations; supports intermittent connectivity via retries and idempotency. |
 | Financial integration | Events and REST | Primary path is event-driven with stable contracts; synchronous calls may be used for validation or acknowledgements per corporate patterns. |
 | Instance routing | HTTP | Each request is routed to a specific `WMSInstance` deployment using an instance identifier and authorization scope. |
+| Inventory operational API | REST | Inventory queries and inventory-affecting commands (receive, reserve, release, status change, adjust). Inventory-affecting commands must be idempotent (QA-04). |
 
 ### 9.- Design decisions
-The following design decisions were made during **Iteration 1** to satisfy the selected drivers.
+The following design decisions were made during the ADD iterations to satisfy the selected drivers.
 
 |Driver|Decision|Rationale|Discarded alternatives|
 |---|---|---|---|
@@ -590,3 +696,7 @@ The following design decisions were made during **Iteration 1** to satisfy the s
 |C-06, QA-06|Enforce **idempotency and deduplication** at the integration boundary using idempotency keys and a dedup store per instance.|Warehouse and automation connectivity can be intermittent; idempotency prevents duplicate effects under retries and supports safe replays of integration calls/messages.|Best-effort retries without idempotency (risk of duplicate downstream effects and operational instability).|
 |C-07, QA-08|Centralize authentication via a shared **identity provider** while keeping authorization checks **instance-scoped** in the core and integration gateway.|Balances operational simplicity with strict instance isolation: authentication is shared, but access decisions remain bounded by warehouse instance context.|Separate identity per instance (maximum isolation but high operational overhead and inconsistent user experience).|
 |C-03|Centralize observability in a shared platform with **strict per-instance partitioning** for logs, metrics, and traces.|Supports fleet operations and troubleshooting at scale while respecting instance isolation requirements.|Per-instance observability stacks (strong isolation but higher cost and fragmented operations).|
+|QA-04, AC-05, US-01, US-02|Adopt an **append-only inventory ledger** (`InventoryLedgerEntry`) as the source of audit truth for all inventory-affecting postings, with `InventoryBalance` maintained as a current-state projection for operational reads.|Provides a consistent, auditable trail for inventory changes and enables verification/replay to detect and correct inconsistencies (**QA-04**, **AC-05**) while preserving fast interactive queries (**QA-05**).|Only persisting mutable `InventoryBalance` rows (simpler but weak auditability and harder to reconcile inconsistencies after failures).|
+|QA-04, AC-05, US-15|Make **inventory invariants explicit** at the inventory boundary (e.g., `availableQty = onHandQty - reservedQty`, non-negative quantities per `Item` + `Location` + `InventoryStatus`) and enforce them as part of inventory postings.|Reduces risk of double allocation and inconsistent availability calculations; concentrates correctness rules where inventory changes occur (**QA-04**) and supports cross-system consistency reasoning (**AC-05**).|Embedding availability/reservation logic across multiple modules (higher inconsistency risk and harder auditability).|
+|QA-04, AC-05, US-15|Model `InventoryReservation` as a **first-class state machine** (Pending → Committed → Consumed/Released/Expired) and record reservation postings in the ledger.|Supports idempotent retries, partial processing, and safe release/expiry semantics; provides traceability for reservation-driven availability changes (**QA-04**, **AC-05**).|Implicit reservations by decrementing `availableQty` only (harder to audit, brittle under retries/partials).|
+|QA-04, QA-05|Require **idempotency for inventory-affecting commands** on the `Inventory operational API` (receipt posting, reserve/release, status change, adjustment), with outcomes recorded for safe retries.|Prevents duplicate effects under intermittent connectivity and retries (**QA-04**) while enabling predictable client behavior and operational recovery without manual reconciliation; keeps interactive flows responsive by avoiding heavyweight locking (**QA-05**).|Best-effort retries without idempotency (duplicate postings and inventory corruption risk).|
