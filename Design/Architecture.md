@@ -2,10 +2,53 @@
 <!-- Create a description of the document -->
 
 ### 2.- Context diagram
-<!-- Include the context diagram from the [FILE:ArchitecturalDrivers.md] document, if available. Include a paragraph at the beginning that describes what this diagram shows. -->
+This diagram shows the system-in-context for a **single `WMSInstance`** (warehouse-scoped deployment) and its primary external interactions. The key architectural intent for Iteration 1 is to establish **instance isolation** (each warehouse instance operates independently) and **decoupled integrations** (stable APIs and/or event streams) so external systems can evolve without changing core WMS domain logic.
+
+```mermaid
+flowchart LR
+  User[Warehouse users]
+  Store[Store systems]
+  Finance[Corporate financial system]
+  Auto[Warehouse automation systems]
+
+  subgraph Instance[WMSInstance]
+    WMS[WMS instance system]
+  end
+
+  User -->|UI and APIs| WMS
+  Store <--> |Replenishment orders and shipment confirmations| WMS
+  Finance <--> |Invoicing relevant shipment events| WMS
+  Auto <--> |Pick tasks and pick confirmations| WMS
+```
 
 ### 3.- Architectural drivers
-<!-- Include a summary of the drivers described in [FILE:ArchitecturalDrivers.md], including their priorities. You should separate user stories, quality attribute scenarios, concerns and constraints in separate tables. -->
+This section summarizes the drivers relevant to **Iteration 1** (initial structuring of the system).
+
+#### Quality attribute scenarios
+
+| ID | Quality Attribute | Scenario summary |
+| :---- | :---- | :---- |
+| QA-06 | Integration | Integrations are decoupled via stable APIs and/or event streams so new systems or instances can be added without changing core WMS code. |
+| QA-08 | Tenant isolation | Issues in one WMS instance must not impact other instances. |
+
+#### Constraints
+
+| ID | Constraint |
+| :---- | :---- |
+| C-01 | Public cloud deployment using managed services where feasible. |
+| C-02 | Multi-country compliance and full i18n/l10n (locale, currency, time zone). |
+| C-03 | Independent WMS instances with possible shared services such as monitoring and identity. |
+| C-04 | Integrate with store systems using standard protocols. |
+| C-05 | Integrate with corporate financial system using agreed integration patterns and data contracts. |
+| C-06 | Integrate with warehouse automation via resilient APIs or connectors tolerant of intermittent connectivity. |
+| C-07 | Comply with corporate security and data protection policies, encryption and RBAC. |
+
+#### Architectural concerns
+
+| ID | Concern |
+| :---- | :---- |
+| AC-02 | Partition the system into modules/services to allow independent evolution while keeping complexity manageable. |
+| AC-04 | Support multiple instances in the cloud with strong isolation and operational simplicity. |
 
 ### 4.- Domain model
 The following domain model represents the **core business concepts inside a single WMS instance** (i.e., one warehouse-scoped or regional deployment with independent data and lifecycle). It focuses on the objects required to support inbound, inventory, outbound fulfillment, counting/reconciliation, and traceability, as described in `Requirements/ArchitecturalDrivers.md`.
@@ -340,16 +383,210 @@ IntegrationMessage "*" --> "0..1" InventoryAdjustment : inventoryMsg
 | `IntegrationMessage` | Records integration exchanges with idempotency key and status to support **exactly-once or idempotent processing** and operational visibility (QA-04, QA-09). |
 
 ### 5.- Container diagram
-<!-- This section contains the main container diagram, according to the C4 approach. This section should also include a table with the name of the container and its responsibilities. -->
+This container view refines the **single `WMSInstance`** into deployable building blocks. It reflects the Iteration 1 strategy: **cell-based isolation per instance**, a **modular core** for the domain, and an **integration boundary** that supports decoupled APIs and event streams.
+
+```mermaid
+flowchart LR
+  User[Warehouse users]
+  Store[Store systems]
+  Finance[Corporate financial system]
+  Auto[Warehouse automation systems]
+
+  subgraph Shared[Shared platform services]
+    IdP[Identity provider]
+    Obs[Central observability]
+  end
+
+  subgraph Instance[WMSInstance isolated deployment]
+    GW[API gateway]
+    Core[WMS core application]
+    Int[Integration gateway]
+    Bus[Event bus]
+    DB[WMS operational database]
+    Idem[Idempotency and dedup store]
+    Outbox[Outbox publisher]
+  end
+
+  User -->|UI and APIs| GW
+  Store <--> |REST and events| GW
+  Finance <--> |REST and events| GW
+  Auto <--> |REST and events| GW
+
+  GW --> Core
+  GW --> Int
+
+  Core --> DB
+  Core --> Outbox
+  Int --> Idem
+  Int --> Outbox
+
+  Outbox --> Bus
+
+  Core -->|AuthN| IdP
+  Int -->|AuthN| IdP
+  Core -->|Logs metrics traces| Obs
+  Int -->|Logs metrics traces| Obs
+  Bus -->|Metrics| Obs
+  DB -->|Metrics| Obs
+```
+
+| Container | Responsibilities |
+|---|---|
+| `API gateway` | Stable entry point; routes traffic to the correct `WMSInstance` deployment; enforces TLS, authentication integration, and coarse rate limits. |
+| `WMS core application` | Modular monolith containing the core WMS domain and workflows for inbound, inventory, outbound, counting, tasking, configuration, and audit. Owns the source of truth for warehouse operational data. |
+| `Integration gateway` | Anti-corruption layer for store, financial, and automation systems; protocol adaptation; contract versioning; idempotency enforcement; transforms external messages into internal commands/events. |
+| `Event bus` | Managed pub/sub fabric for decoupled integrations; enables event-driven fan-out and asynchronous processing per instance. |
+| `WMS operational database` | Primary per-instance datastore for core operational entities, configuration, and audit trails. |
+| `Idempotency and dedup store` | Stores idempotency keys and processing outcomes for external requests/messages to prevent duplicate effects under retries/failures. |
+| `Outbox publisher` | Transactional outbox publisher that reliably emits integration events from committed database changes to the event bus. |
+| `Identity provider` | Centralized identity service used by all instances; provides authentication tokens and identity lifecycle. |
+| `Central observability` | Centralized logs/metrics/traces collection with strict per-instance partitioning for supportability. |
 
 ### 6.- Component diagrams
-<!-- Component diagrams thar correspond to the containers go here, Each component diagram should have an associated table with the name of the components and their responsibilities. -->
+The following component view refines the `WMS core application` into **bounded modules**. These are logical components intended to minimize coupling and enable future extraction if needed.
+
+```mermaid
+flowchart TB
+  subgraph Core[WMS core application]
+    Inb[Inbound module]
+    Inv[Inventory module]
+    Out[Outbound module]
+    Task[Tasking module]
+    Cfg[Configuration module]
+    Aud[Audit and traceability module]
+    Sec[Authorization module]
+    Pub[Outbox and event publication module]
+  end
+
+  Inb --> Inv
+  Out --> Inv
+  Task --> Inb
+  Task --> Out
+  Inb --> Aud
+  Inv --> Aud
+  Out --> Aud
+  Cfg --> Inb
+  Cfg --> Out
+  Sec --> Inb
+  Sec --> Inv
+  Sec --> Out
+  Pub --> Aud
+```
+
+| Component | Responsibilities |
+|---|---|
+| `Inbound module` | Inbound shipment and receiving lifecycle; receipts; put-away task creation; exception capture for inbound. |
+| `Inventory module` | Inventory balances, statuses, reservations, adjustments, and inventory-affecting invariants. |
+| `Outbound module` | Replenishment orders; allocation and wave planning scaffolding; shipment lifecycle and contents. |
+| `Tasking module` | Work orchestration for put-away, picking, packing tasks; work queue queries; task assignment scaffolding. |
+| `Configuration module` | Warehouse-specific configuration such as locations, units of measure, strategies, and integrations configuration. |
+| `Audit and traceability module` | Immutable audit events for inventory-affecting actions and integration processing trace. |
+| `Authorization module` | Role-based authorization checks scoped to warehouse instance and roles. |
+| `Outbox and event publication module` | Transactional outbox writes and publication coordination for domain and integration events. |
 
 ### 7.- Sequence diagrams
-<!-- For each functional requirement or quality attribute, a sequence diagram will be included here. Below each sequence diagram, there should be a description of what the diagram represents -->
+The sequence diagrams below illustrate the **walking skeleton** interactions for Iteration 1. They focus on **decoupled integration** (QA-06) and **per-instance isolation boundaries** (QA-08) by showing how external interactions enter through the `API gateway`, are normalized by the `Integration gateway`, and are committed and published via an outbox and event bus.
+
+#### Sequence 1: Store submits replenishment order
+This sequence shows a store system submitting an order through a stable API with idempotency. The integration gateway translates the request into an internal command, commits it, and emits an event via the outbox.
+
+```mermaid
+sequenceDiagram
+  participant Store as Store system
+  participant GW as API gateway
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  Store->>GW: Submit replenishment order
+  GW->>Int: Route to instance integration API
+  Int->>Idem: Check idempotency key
+  Idem-->>Int: Not processed
+  Int->>Core: Create replenishment order command
+  Core->>DB: Persist order and audit event
+  Core->>DB: Write outbox record
+  Core-->>Int: Order accepted
+  Int-->>Store: 202 Accepted with order reference
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish order accepted event
+```
+
+#### Sequence 2: Automation confirms picks
+This sequence shows an automation system confirming picks with idempotency to avoid duplicate inventory updates under retries.
+
+```mermaid
+sequenceDiagram
+  participant Auto as Automation system
+  participant GW as API gateway
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  Auto->>GW: Confirm picks
+  GW->>Int: Route to instance automation API
+  Int->>Idem: Check idempotency key
+  Idem-->>Int: Not processed
+  Int->>Core: Record pick confirmation command
+  Core->>DB: Persist pick confirmation and audit event
+  Core->>DB: Update inventory balances
+  Core->>DB: Write outbox record
+  Core-->>Int: Confirmation recorded
+  Int-->>Auto: 200 OK
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish pick confirmed event
+```
+
+#### Sequence 3: Shipment confirmation triggers downstream notifications
+This sequence shows shipment confirmation being committed once and producing downstream events for store and financial integrations.
+
+```mermaid
+sequenceDiagram
+  participant User as Shipping operator
+  participant GW as API gateway
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+  participant Store as Store system
+  participant Finance as Financial system
+
+  User->>GW: Confirm shipment
+  GW->>Core: Route to instance shipping API
+  Core->>DB: Persist shipment and audit event
+  Core->>DB: Write outbox records
+  Core-->>User: Shipment confirmed
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish shipment confirmed event
+  Bus-->>Store: Shipment confirmation event
+  Bus-->>Finance: Financial shipment event
+```
 
 ### 8.- Interfaces
-<!-- This section will include details about contracts- -->
+This section lists the primary interface shapes established in Iteration 1. Detailed contracts and schemas will be refined in later iterations.
+
+| Interface | Type | Notes |
+|---|---|---|
+| Store integration API | REST | Versioned endpoints for replenishment orders and shipment confirmations; idempotency keys required. |
+| Automation integration API | REST | Versioned endpoints for pick task distribution and pick confirmations; supports intermittent connectivity via retries and idempotency. |
+| Financial integration | Events and REST | Primary path is event-driven with stable contracts; synchronous calls may be used for validation or acknowledgements per corporate patterns. |
+| Instance routing | HTTP | Each request is routed to a specific `WMSInstance` deployment using an instance identifier and authorization scope. |
 
 ### 9.- Design decisions
-<!-- This section describes the relevant design decisions that resulted in this design. -->
+The following design decisions were made during **Iteration 1** to satisfy the selected drivers.
+
+|Driver|Decision|Rationale|Discarded alternatives|
+|---|---|---|---|
+|AC-04, QA-08, C-03|Adopt a **cell-based instance model** where each `WMSInstance` is an isolated deployment unit with its own primary datastore and eventing resources; requests are routed to the correct instance at the edge.|Strong fault and performance isolation reduces blast radius and prevents noisy-neighbor effects; enables independent lifecycle management per warehouse instance while still allowing selective shared platform services.|Shared multi-tenant runtime and shared database with tenant partitioning (lower baseline cost but weaker isolation and higher operational and data-leakage risk).|
+|AC-02|Implement the core WMS as a **modular monolith** for Iteration 1, with bounded modules for inbound, inventory, outbound, tasking, configuration, audit, and authorization.|Establishes clear internal boundaries without premature distributed-systems complexity; supports a walking skeleton quickly while keeping the design evolvable.|Microservices from day one (better independent scaling but significantly higher complexity, latency, and operational burden early).|
+|QA-06, C-04, C-05, C-06|Introduce an **Integration gateway** as an anti-corruption layer for store, financial, and automation systems; centralize protocol adaptation and contract versioning outside the domain core.|Decouples external system variability from the core domain; supports adding new systems or changing protocols without changing core modules; improves maintainability and reduces integration-induced coupling.|Embedding adapters and protocol logic directly inside domain modules (faster initially but brittle and hard to evolve across many integrations).|
+|QA-06, C-01|Use a **managed event bus** for asynchronous integration flows and fan-out, complemented by synchronous REST APIs where needed.|Enables stable event streams and loose coupling; supports asynchronous workflows and future extensibility while leveraging managed services to reduce ops burden.|Purely synchronous point-to-point REST for all integrations (tighter coupling and lower resilience to spikes and downtime).|
+|QA-06|Adopt **transactional outbox** in the per-instance database with an **outbox publisher** to publish events to the event bus.|Avoids dual-write inconsistencies; ensures events correspond to committed state changes; provides a reliable foundation for decoupled integration messaging.|Direct publish to the event bus inside request processing without outbox (risk of lost or duplicated events under failures).|
+|C-06, QA-06|Enforce **idempotency and deduplication** at the integration boundary using idempotency keys and a dedup store per instance.|Warehouse and automation connectivity can be intermittent; idempotency prevents duplicate effects under retries and supports safe replays of integration calls/messages.|Best-effort retries without idempotency (risk of duplicate downstream effects and operational instability).|
+|C-07, QA-08|Centralize authentication via a shared **identity provider** while keeping authorization checks **instance-scoped** in the core and integration gateway.|Balances operational simplicity with strict instance isolation: authentication is shared, but access decisions remain bounded by warehouse instance context.|Separate identity per instance (maximum isolation but high operational overhead and inconsistent user experience).|
+|C-03|Centralize observability in a shared platform with **strict per-instance partitioning** for logs, metrics, and traces.|Supports fleet operations and troubleshooting at scale while respecting instance isolation requirements.|Per-instance observability stacks (strong isolation but higher cost and fragmented operations).|
