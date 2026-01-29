@@ -31,6 +31,7 @@ This section summarizes the drivers relevant to the ADD iterations captured in t
 | 1 | Initial structuring of a single `WMSInstance` and its integration boundaries | **Quality**: QA-06, QA-08. **Constraints**: C-01..C-07. **Concerns**: AC-02, AC-04 |
 | 2 | Foundation for inventory correctness (balances, statuses, reservations) | **Quality**: QA-04, QA-05. **User stories**: US-01, US-02, US-15. **Concerns**: AC-05 |
 | 3 | High-throughput replenishment order intake and planning | **Quality**: QA-01, QA-04. **User stories**: US-03, US-04. **Concerns**: AC-01, AC-02 |
+| 4 | Picking execution and automation integration | **Quality**: QA-04, QA-05, QA-06. **User stories**: US-05, US-06, US-07. **Constraints**: C-06. **Concerns**: AC-03 |
 
 #### Quality attribute scenarios
 
@@ -559,7 +560,7 @@ sequenceDiagram
 ```
 
 #### Sequence 2: Automation confirms picks
-This sequence shows an automation system confirming picks with idempotency to avoid duplicate inventory updates under retries.
+This sequence shows an automation system confirming picks with **inbox-first durability** and idempotency to avoid duplicate inventory updates under retries and intermittent connectivity.
 
 ```mermaid
 sequenceDiagram
@@ -576,15 +577,20 @@ sequenceDiagram
   GW->>Int: Route to instance automation API
   Int->>Idem: Check idempotency key
   Idem-->>Int: Not processed
+  Int->>DB: Persist IntegrationMessage received
   Int->>Core: Record pick confirmation command
   Core->>DB: Persist pick confirmation and audit event
-  Core->>DB: Update inventory balances
+  Core->>DB: Consume reservations and append InventoryLedgerEntry
+  Core->>DB: Update InventoryBalance projection
   Core->>DB: Write outbox record
   Core-->>Int: Confirmation recorded
-  Int-->>Auto: 200 OK
+  Int->>Idem: Record outcome for idempotency key
+  Int->>DB: Mark IntegrationMessage processed
+  Int-->>Auto: 200 OK with confirmation reference
   Out->>DB: Poll pending outbox
   Out->>Bus: Publish pick confirmed event
 ```
+
 
 #### Sequence 3: Shipment confirmation triggers downstream notifications
 This sequence shows shipment confirmation being committed once and producing downstream events for store and financial integrations.
@@ -731,13 +737,92 @@ sequenceDiagram
   Out->>Bus: Publish allocation created and wave released events
 ```
 
+#### Sequence 9: Distribute pick tasks to automation with store and forward (Iteration 4)
+This sequence shows pick task distribution using a store-and-forward connector in the integration boundary so intermittent automation connectivity does not block warehouse execution.
+
+```mermaid
+sequenceDiagram
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
+  participant Auto as Automation system
+
+  Core->>DB: Create PickTask records for released work
+  Core->>DB: Write outbox record pick tasks ready
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish pick tasks ready event
+  Bus-->>Int: Deliver pick tasks ready event
+  Int->>DB: Persist outbound IntegrationMessage pending
+  Int->>Idem: Generate idempotency key for task delivery
+  Int->>Auto: Deliver pick tasks batch with idempotency key
+  Auto-->>Int: Acknowledge received
+  Int->>DB: Mark IntegrationMessage delivered
+  Int->>DB: Write outbox record pick tasks dispatched
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish pick tasks dispatched event
+```
+
+#### Sequence 10: Manual picker confirms picks (Iteration 4)
+This sequence shows a picker confirming picks via the WMS UI/API, with inventory postings handled at the inventory boundary for correctness and auditability.
+
+```mermaid
+sequenceDiagram
+  participant User as Picker
+  participant GW as API gateway
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  User->>GW: Confirm pick
+  GW->>Core: Route to instance picking API
+  Core->>DB: Persist pick confirmation and audit event
+  Core->>DB: Consume reservations and append InventoryLedgerEntry
+  Core->>DB: Update InventoryBalance projection
+  Core->>DB: Update PickTask status confirmed
+  Core->>DB: Write outbox record pick confirmed
+  Core-->>User: Pick confirmation accepted
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish pick confirmed event
+```
+
+#### Sequence 11: Register and resolve a picking exception (Iteration 4)
+This sequence shows a supervisor capturing a picking exception and resolving it with controlled, auditable actions so operations continue without corrupting inventory.
+
+```mermaid
+sequenceDiagram
+  participant User as Supervisor
+  participant GW as API gateway
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  User->>GW: Register picking exception
+  GW->>Core: Route to instance exception API
+  Core->>DB: Create ExceptionCase and link PickTask
+  Core->>DB: Update PickTask status exception
+  Core->>DB: Persist AuditEvent
+  Core-->>User: Exception recorded
+  User->>GW: Resolve exception action
+  GW->>Core: Route to instance exception API
+  Core->>DB: Apply resolution decision and persist AuditEvent
+  Core->>DB: Write outbox record exception resolved
+  Core-->>User: Exception resolved
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish exception resolved event
+```
+
 ### 8.- Interfaces
 This section lists the primary interface shapes established in Iteration 1. Detailed contracts and schemas will be refined in later iterations.
 
 | Interface | Type | Notes |
 |---|---|---|
 | Store integration API | REST | Versioned endpoints for replenishment orders and shipment confirmations; idempotency keys required; order intake is durably accepted (202) and planned asynchronously in Iteration 3. |
-| Automation integration API | REST | Versioned endpoints for pick task distribution and pick confirmations; supports intermittent connectivity via retries and idempotency. |
+| Automation integration API | REST | Versioned endpoints for pick task distribution and pick confirmations; supports intermittent connectivity via retries and idempotency; requires correlation identifiers (`pickTaskId`, `correlationId`) and idempotency keys for confirmations and task delivery acknowledgements. |
 | Financial integration | Events and REST | Primary path is event-driven with stable contracts; synchronous calls may be used for validation or acknowledgements per corporate patterns. |
 | Instance routing | HTTP | Each request is routed to a specific `WMSInstance` deployment using an instance identifier and authorization scope. |
 | Inventory operational API | REST | Inventory queries and inventory-affecting commands (receive, reserve, release, status change, adjust). Inventory-affecting commands must be idempotent (QA-04). |
@@ -763,3 +848,7 @@ The following design decisions were made during the ADD iterations to satisfy th
 |QA-01, AC-02, US-04|Partition outbound planning into **Order Intake** (validation/normalization) and **Planning** (allocation/wave building) responsibilities within the `Outbound module` and execute planning via horizontally-scalable workers.|Improves modularity and scalability at the hotspot without introducing distributed-service complexity; planning throughput can scale independently from ingestion, supporting **QA-01** and keeping boundaries manageable (**AC-02**).|Single monolithic outbound workflow component for both ingestion and planning (harder to scale and evolve).|
 |QA-04, US-04|Make **reservation-based allocation** the correctness boundary during planning: allocation commits `InventoryReservation` and related ledger/balance updates atomically with allocation artifacts.|Prevents double allocation under concurrent planning/retries; leverages inventory invariants and auditability foundation from Iteration 2 to preserve **QA-04** during high-throughput allocation.|Allocating by directly decrementing availability in outbound tables without inventory postings (inconsistent source of truth and weaker auditability).|
 |QA-04, QA-01, US-04|Emit `allocation created` and `wave released` as **transactional outbox events** tied to committed planning state.|Ensures downstream systems and workers see only committed planning outcomes (**QA-04**) while enabling asynchronous fan-out and scaling (**QA-01**).|Direct bus publish inside planning transaction without outbox (risk of lost/duplicated events).|
+|QA-04, QA-06, C-06, AC-03, US-05|Adopt a **store-and-forward automation connector** at the integration boundary: persist outbound pick task messages and manage delivery with retries/backoff and acknowledgements.|Tolerates intermittent warehouse automation connectivity (**C-06**) while keeping integrations decoupled (**QA-06**) and preventing lost/duplicated task dispatch effects under retries (**QA-04**); isolates protocol/vendor variability (**AC-03**).|Pure synchronous “push tasks” from core to automation (tight coupling, fragile under connectivity issues); direct point-to-point calls without durable send state (hard to recover).|
+|QA-04, QA-06, AC-03, US-07|Require **idempotent pick confirmations** from automation (and manual confirmation APIs) using idempotency keys and recorded outcomes, with stable correlation identifiers (`pickTaskId`, `correlationId`).|Prevents duplicate inventory postings and duplicated confirmations under retries (**QA-04**); improves reconciliation and traceability across systems (**QA-06**, **AC-03**).|Attempting exactly-once delivery “over the wire” (unrealistic); best-effort retries without dedup (inventory corruption risk).|
+|QA-04, AC-05, US-07|Handle pick confirmations by **posting through the Inventory module boundary** (consume reservations, append `InventoryLedgerEntry`, update `InventoryBalance` projection) as a single correctness boundary.|Reuses the inventory correctness foundation to ensure picks consistently affect inventory with auditability and replayability (**QA-04**, **AC-05**), regardless of source (automation or manual).|Updating inventory directly in tasking/integration code paths (leaks invariants and increases inconsistency risk).|
+|US-06, QA-04|Treat picking exceptions as **first-class workflow** (`ExceptionCase`) with controlled resolution actions and audit events, tied to `PickTask` state transitions.|Keeps operations running while preventing ad-hoc inventory changes; provides auditable, supervised resolution that preserves correctness under disruptions (**US-06**, **QA-04**).|Manual out-of-band fixes and spreadsheet reconciliation (fast locally but high integrity/compliance risk); burying exceptions in logs only (poor operational control).|
