@@ -32,6 +32,7 @@ This section summarizes the drivers relevant to the ADD iterations captured in t
 | 2 | Foundation for inventory correctness (balances, statuses, reservations) | **Quality**: QA-04, QA-05. **User stories**: US-01, US-02, US-15. **Concerns**: AC-05 |
 | 3 | High-throughput replenishment order intake and planning | **Quality**: QA-01, QA-04. **User stories**: US-03, US-04. **Concerns**: AC-01, AC-02 |
 | 4 | Picking execution and automation integration | **Quality**: QA-04, QA-05, QA-06. **User stories**: US-05, US-06, US-07. **Constraints**: C-06. **Concerns**: AC-03 |
+| 5 | Outbound shipping confirmations and financial integration | **Quality**: QA-04, QA-06. **User stories**: US-08, US-09, US-10. **Constraints**: C-04, C-05. **Concerns**: AC-03, AC-05 |
 
 #### Quality attribute scenarios
 
@@ -60,6 +61,7 @@ This section summarizes the drivers relevant to the ADD iterations captured in t
 | :---- | :---- |
 | AC-02 | Partition the system into modules/services to allow independent evolution while keeping complexity manageable. |
 | AC-04 | Support multiple instances in the cloud with strong isolation and operational simplicity. |
+| AC-03 | Design integrations with store systems, financial systems, and automation using reliable, idempotent, resilient APIs and/or event-driven mechanisms. |
 | AC-05 | Ensure consistent inventory and shipment data across WMS and external systems in the presence of asynchronous messaging and failures. |
 
 ### 4.- Domain model
@@ -397,8 +399,8 @@ IntegrationMessage "*" --> "0..1" InventoryAdjustment : inventoryMsg
 | `PickConfirmation` | Confirmation of picked quantity (manual or from automation). Updates inventory and downstream packing/shipping state (US-07). |
 | `PackTask` | Work to pack picked items into handling units for shipment (US-08). |
 | `Package` | A carton/pallet (handling unit) produced during packing; supports content tracking communicated to stores (US-09). |
-| `Shipment` | Outbound shipment entity used to confirm shipping, communicate contents, and trigger financial events (US-08, US-09, US-10). |
-| `ShipmentLine` | Item-level shipped quantities used for store updates and invoicing-relevant data. |
+| `Shipment` | Outbound shipment entity used to confirm shipping, communicate contents, and trigger financial events (US-08, US-09, US-10). On confirmation, the WMS commits an immutable **shipment contents snapshot** for downstream integrations and audit. |
+| `ShipmentLine` | Item-level shipped quantities used for store updates and invoicing-relevant data. Acts as the canonical payload source for the shipment contents snapshot. |
 | `InventoryCount` | Cycle count or full physical count activity (US-11). Drives reconciliation and adjustment workflows. |
 | `CountLine` | Counted quantity per item (and optionally location), enabling discrepancy calculation. |
 | `InventoryAdjustment` | Inventory delta created by reconciliation. Must be auditable and may require approval and reason codes (US-11, US-18). |
@@ -409,7 +411,7 @@ IntegrationMessage "*" --> "0..1" InventoryAdjustment : inventoryMsg
 | `User` | Human user identity inside a WMS instance context. Role assignment enables RBAC (US-13, QA-07). |
 | `Role` | Role definitions used for authorization by role and warehouse (QA-07). |
 | `ExternalSystem` | Represents integrated systems (store systems, financial system, picking systems) to support decoupled integrations (QA-06). |
-| `IntegrationMessage` | Records integration exchanges with idempotency key and status to support **exactly-once or idempotent processing** and operational visibility (QA-04, QA-09). |
+| `IntegrationMessage` | Records integration exchanges with idempotency key and status (e.g., Pending, Sent, Acked, Failed) to support **idempotent processing**, durable delivery tracking, replay, and operational visibility (QA-04, QA-09). |
 
 #### Inventory invariants and reservation lifecycle (Iteration 2)
 - **Inventory invariants**: `availableQty = onHandQty - reservedQty` and all quantities are non-negative per `Item` + `Location` + `InventoryStatus`.
@@ -593,7 +595,7 @@ sequenceDiagram
 
 
 #### Sequence 3: Shipment confirmation triggers downstream notifications
-This sequence shows shipment confirmation being committed once and producing downstream events for store and financial integrations.
+This sequence shows shipment confirmation being committed once (idempotent) and producing downstream notifications to store and financial systems via the integration boundary, with durable delivery tracking.
 
 ```mermaid
 sequenceDiagram
@@ -603,18 +605,37 @@ sequenceDiagram
   participant DB as WMS database
   participant Out as Outbox publisher
   participant Bus as Event bus
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
   participant Store as Store system
   participant Finance as Financial system
 
-  User->>GW: Confirm shipment
+  User->>GW: Confirm shipment with idempotency key
   GW->>Core: Route to instance shipping API
-  Core->>DB: Persist shipment and audit event
-  Core->>DB: Write outbox records
-  Core-->>User: Shipment confirmed
+  Core->>DB: Confirm shipment and commit contents snapshot
+  Core->>DB: Persist AuditEvent
+  Core->>DB: Write outbox record shipment confirmed
+  Core-->>User: Shipment confirmed response
+
   Out->>DB: Poll pending outbox
   Out->>Bus: Publish shipment confirmed event
-  Bus-->>Store: Shipment confirmation event
-  Bus-->>Finance: Financial shipment event
+
+  Bus-->>Int: Deliver shipment confirmed event
+  Int->>Idem: Check dedup for shipment and target Store
+  Idem-->>Int: Not processed
+  Int->>DB: Persist IntegrationMessage pending for Store
+  Int->>Store: Deliver shipment confirmation message
+  Store-->>Int: Acknowledge received
+  Int->>DB: Mark IntegrationMessage acked for Store
+  Int->>Idem: Record outcome for Store dedup key
+
+  Int->>Idem: Check dedup for shipment and target Finance
+  Idem-->>Int: Not processed
+  Int->>DB: Persist IntegrationMessage pending for Finance
+  Int->>Finance: Deliver financial shipment message
+  Finance-->>Int: Acknowledge received
+  Int->>DB: Mark IntegrationMessage acked for Finance
+  Int->>Idem: Record outcome for Finance dedup key
 ```
 
 #### Sequence 4: Receiving posts inventory with auditable ledger entry (Iteration 2)
@@ -816,14 +837,45 @@ sequenceDiagram
   Out->>Bus: Publish exception resolved event
 ```
 
+#### Sequence 12: Retrying outbound store and finance deliveries (Iteration 5)
+This sequence illustrates the operational behavior for asynchronous delivery when an external target is temporarily unavailable: deliveries are retried from durable state without duplicating effects.
+
+```mermaid
+sequenceDiagram
+  participant Bus as Event bus
+  participant Int as Integration gateway
+  participant DB as WMS database
+  participant Idem as Idempotency store
+  participant Store as Store system
+
+  Bus-->>Int: Deliver shipment confirmed event
+  Int->>Idem: Check dedup for shipment and target Store
+  Idem-->>Int: Not processed
+  Int->>DB: Persist IntegrationMessage pending for Store
+  Int->>Store: Deliver shipment confirmation message
+  Store-->>Int: Error or timeout
+  Int->>DB: Mark IntegrationMessage failed and schedule retry
+
+  Int->>DB: Retry pending IntegrationMessage
+  Int->>Idem: Check dedup for same delivery key
+  Idem-->>Int: Not processed
+  Int->>Store: Deliver shipment confirmation message with same idempotency key
+  Store-->>Int: Acknowledge received
+  Int->>DB: Mark IntegrationMessage acked
+  Int->>Idem: Record outcome for dedup key
+```
+
+
+
 ### 8.- Interfaces
 This section lists the primary interface shapes established in Iteration 1. Detailed contracts and schemas will be refined in later iterations.
 
 | Interface | Type | Notes |
 |---|---|---|
-| Store integration API | REST | Versioned endpoints for replenishment orders and shipment confirmations; idempotency keys required; order intake is durably accepted (202) and planned asynchronously in Iteration 3. |
+| Store integration API | REST and events | Inbound: versioned endpoints for replenishment orders with idempotency keys required; order intake is durably accepted (202) and planned asynchronously in Iteration 3. Outbound: shipment confirmation messages emitted as versioned events and delivered with durable `IntegrationMessage` tracking and idempotent delivery semantics (Iteration 5). |
 | Automation integration API | REST | Versioned endpoints for pick task distribution and pick confirmations; supports intermittent connectivity via retries and idempotency; requires correlation identifiers (`pickTaskId`, `correlationId`) and idempotency keys for confirmations and task delivery acknowledgements. |
-| Financial integration | Events and REST | Primary path is event-driven with stable contracts; synchronous calls may be used for validation or acknowledgements per corporate patterns. |
+| Financial integration | Events and REST | Primary path is event-driven with stable contracts. Shipment financial messages are emitted from confirmed shipment state (outbox) and delivered with durable `IntegrationMessage` tracking and idempotent delivery semantics (Iteration 5). Synchronous calls may be used for validation or acknowledgements per corporate patterns. |
+| Shipping operational API | REST | Confirm shipment endpoint for warehouse users. Requires an idempotency key so retries or double-submits return the same outcome without duplicating shipment confirmation or downstream messages (Iteration 5). |
 | Instance routing | HTTP | Each request is routed to a specific `WMSInstance` deployment using an instance identifier and authorization scope. |
 | Inventory operational API | REST | Inventory queries and inventory-affecting commands (receive, reserve, release, status change, adjust). Inventory-affecting commands must be idempotent (QA-04). |
 
@@ -852,3 +904,7 @@ The following design decisions were made during the ADD iterations to satisfy th
 |QA-04, QA-06, AC-03, US-07|Require **idempotent pick confirmations** from automation (and manual confirmation APIs) using idempotency keys and recorded outcomes, with stable correlation identifiers (`pickTaskId`, `correlationId`).|Prevents duplicate inventory postings and duplicated confirmations under retries (**QA-04**); improves reconciliation and traceability across systems (**QA-06**, **AC-03**).|Attempting exactly-once delivery “over the wire” (unrealistic); best-effort retries without dedup (inventory corruption risk).|
 |QA-04, AC-05, US-07|Handle pick confirmations by **posting through the Inventory module boundary** (consume reservations, append `InventoryLedgerEntry`, update `InventoryBalance` projection) as a single correctness boundary.|Reuses the inventory correctness foundation to ensure picks consistently affect inventory with auditability and replayability (**QA-04**, **AC-05**), regardless of source (automation or manual).|Updating inventory directly in tasking/integration code paths (leaks invariants and increases inconsistency risk).|
 |US-06, QA-04|Treat picking exceptions as **first-class workflow** (`ExceptionCase`) with controlled resolution actions and audit events, tied to `PickTask` state transitions.|Keeps operations running while preventing ad-hoc inventory changes; provides auditable, supervised resolution that preserves correctness under disruptions (**US-06**, **QA-04**).|Manual out-of-band fixes and spreadsheet reconciliation (fast locally but high integrity/compliance risk); burying exceptions in logs only (poor operational control).|
+|QA-04, AC-05, US-08|Treat **shipment confirmation** as the single atomic correctness boundary: confirm shipment, commit an immutable contents snapshot, persist `AuditEvent`, and write outbox records in one transaction.|Prevents partial “confirmed but not publishable” states and eliminates dual-write gaps; provides a deterministic source for downstream store confirmations and financial events while preserving auditability (**QA-04**, **AC-05**).|Multi-step confirmation flow with separate publish calls (higher inconsistency risk); direct publish without outbox inside confirmation path (lost/duplicate event risk).|
+|QA-06, C-04, C-05, AC-03, US-09, US-10|Deliver store confirmations and financial shipment events through the **Integration gateway** consuming the event bus, with anti-corruption mapping per target system.|Centralizes protocol adaptation and contract governance at the boundary; keeps the core domain stable while meeting external integration requirements (**QA-06**, **C-04**, **C-05**) and strengthening integration resilience (**AC-03**).|Embedding store/finance adapters inside core outbound logic (tighter coupling); direct point-to-point core calls to external systems (lower resilience, harder evolution).|
+|QA-04, AC-03, US-09, US-10|Use `IntegrationMessage` as a durable delivery record for outbound store/finance deliveries with explicit state transitions and replay controls.|Provides traceability and operational control for retries/backoff and recovery; supports safe reprocessing without duplicating downstream effects (**QA-04**) and improves integration operability (**AC-03**).|Fire-and-forget publishing with no delivery state (poor recovery); relying on logs only (high operational risk).|
+|QA-04, AC-03, US-08, US-09, US-10|Enforce **idempotency/dedup** for shipment confirmation and per-target outbound deliveries using idempotency keys and recorded outcomes in the idempotency store.|Ensures retries (UI double-submit, transient failures, replays) do not create duplicate confirmations or financial postings; provides “same request, same outcome” semantics across boundaries (**QA-04**, **AC-03**).|Attempting exactly-once delivery “over the wire” (unrealistic); best-effort retries without dedup (duplicate store confirmations/invoices risk).|
