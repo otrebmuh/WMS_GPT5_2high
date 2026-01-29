@@ -30,6 +30,7 @@ This section summarizes the drivers relevant to the ADD iterations captured in t
 |---:|---|---|
 | 1 | Initial structuring of a single `WMSInstance` and its integration boundaries | **Quality**: QA-06, QA-08. **Constraints**: C-01..C-07. **Concerns**: AC-02, AC-04 |
 | 2 | Foundation for inventory correctness (balances, statuses, reservations) | **Quality**: QA-04, QA-05. **User stories**: US-01, US-02, US-15. **Concerns**: AC-05 |
+| 3 | High-throughput replenishment order intake and planning | **Quality**: QA-01, QA-04. **User stories**: US-03, US-04. **Concerns**: AC-01, AC-02 |
 
 #### Quality attribute scenarios
 
@@ -520,7 +521,7 @@ flowchart TB
 |---|---|
 | `Inbound module` | Inbound shipment and receiving lifecycle; receipts; put-away task creation; exception capture for inbound. |
 | `Inventory module` | Inventory balances, statuses, reservations, adjustments, and inventory-affecting invariants. |
-| `Outbound module` | Replenishment orders; allocation and wave planning scaffolding; shipment lifecycle and contents. |
+| `Outbound module` | Replenishment orders and their lifecycle; order intake validation and normalization; allocation and wave planning; planning work partitioning; shipment lifecycle and contents. |
 | `Tasking module` | Work orchestration for put-away, picking, packing tasks; work queue queries; task assignment scaffolding. |
 | `Configuration module` | Warehouse-specific configuration such as locations, units of measure, strategies, and integrations configuration. |
 | `Audit and traceability module` | Immutable audit events for inventory-affecting actions and integration processing trace. |
@@ -672,12 +673,70 @@ sequenceDiagram
   Core-->>User: Status change recorded
 ```
 
+#### Sequence 7: Async order intake with durable acceptance and planning trigger (Iteration 3)
+This sequence refines replenishment order intake to support peak throughput by durably accepting requests (idempotent) and triggering downstream planning asynchronously via the outbox and event bus.
+
+```mermaid
+sequenceDiagram
+  participant Store as Store system
+  participant GW as API gateway
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+  participant Plan as Planning worker
+
+  Store->>GW: Submit replenishment order
+  GW->>Int: Route to instance store API
+  Int->>Idem: Check idempotency key
+  Idem-->>Int: Not processed
+  Int->>Core: Create order command
+  Core->>DB: Persist ReplenishmentOrder with status Accepted
+  Core->>DB: Persist AuditEvent for order intake
+  Core->>DB: Write outbox record order accepted
+  Core-->>Int: Accepted with order reference
+  Int-->>Store: 202 Accepted with order reference
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish order accepted event
+  Bus-->>Plan: Deliver planning trigger event
+  Plan->>Core: Enqueue planning job for order group
+  Core->>DB: Persist planning job with status Pending
+```
+
+#### Sequence 8: Allocation and wave planning with reservation-based correctness (Iteration 3)
+This sequence shows planning consuming a planning job, allocating inventory by committing reservations (inventory invariants), building a wave, and generating pick tasks while emitting durable events via the outbox.
+
+```mermaid
+sequenceDiagram
+  participant Plan as Planning worker
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  Plan->>Core: Start planning job
+  Core->>DB: Load eligible ReplenishmentOrderLine items
+  Core->>DB: Validate allocation eligibility by InventoryStatus
+  Core->>DB: Create InventoryReservation committed for demand lines
+  Core->>DB: Append InventoryLedgerEntry for reservation postings
+  Core->>DB: Update InventoryBalance reservedQty and availableQty
+  Core->>DB: Persist Allocation and link to ReplenishmentOrder
+  Core->>DB: Create Wave for grouped pick work
+  Core->>DB: Create PickTask records derived from Wave
+  Core->>DB: Persist AuditEvent for planning decisions
+  Core->>DB: Write outbox records allocation created and wave released
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish allocation created and wave released events
+```
+
 ### 8.- Interfaces
 This section lists the primary interface shapes established in Iteration 1. Detailed contracts and schemas will be refined in later iterations.
 
 | Interface | Type | Notes |
 |---|---|---|
-| Store integration API | REST | Versioned endpoints for replenishment orders and shipment confirmations; idempotency keys required. |
+| Store integration API | REST | Versioned endpoints for replenishment orders and shipment confirmations; idempotency keys required; order intake is durably accepted (202) and planned asynchronously in Iteration 3. |
 | Automation integration API | REST | Versioned endpoints for pick task distribution and pick confirmations; supports intermittent connectivity via retries and idempotency. |
 | Financial integration | Events and REST | Primary path is event-driven with stable contracts; synchronous calls may be used for validation or acknowledgements per corporate patterns. |
 | Instance routing | HTTP | Each request is routed to a specific `WMSInstance` deployment using an instance identifier and authorization scope. |
@@ -700,3 +759,7 @@ The following design decisions were made during the ADD iterations to satisfy th
 |QA-04, AC-05, US-15|Make **inventory invariants explicit** at the inventory boundary (e.g., `availableQty = onHandQty - reservedQty`, non-negative quantities per `Item` + `Location` + `InventoryStatus`) and enforce them as part of inventory postings.|Reduces risk of double allocation and inconsistent availability calculations; concentrates correctness rules where inventory changes occur (**QA-04**) and supports cross-system consistency reasoning (**AC-05**).|Embedding availability/reservation logic across multiple modules (higher inconsistency risk and harder auditability).|
 |QA-04, AC-05, US-15|Model `InventoryReservation` as a **first-class state machine** (Pending → Committed → Consumed/Released/Expired) and record reservation postings in the ledger.|Supports idempotent retries, partial processing, and safe release/expiry semantics; provides traceability for reservation-driven availability changes (**QA-04**, **AC-05**).|Implicit reservations by decrementing `availableQty` only (harder to audit, brittle under retries/partials).|
 |QA-04, QA-05|Require **idempotency for inventory-affecting commands** on the `Inventory operational API` (receipt posting, reserve/release, status change, adjustment), with outcomes recorded for safe retries.|Prevents duplicate effects under intermittent connectivity and retries (**QA-04**) while enabling predictable client behavior and operational recovery without manual reconciliation; keeps interactive flows responsive by avoiding heavyweight locking (**QA-05**).|Best-effort retries without idempotency (duplicate postings and inventory corruption risk).|
+|QA-01, AC-01, US-03|Adopt an **async order intake** model: durably accept replenishment orders (202) after persistence, then trigger downstream planning asynchronously via outbox/event bus.|Decouples peak API traffic from planning compute to sustain **10,000 orders/hour** without downtime (**QA-01**), while preserving durability and recoverability of accepted demand.|Synchronous “submit and allocate” in the API path (higher tail latency and overload risk at peak).|
+|QA-01, AC-02, US-04|Partition outbound planning into **Order Intake** (validation/normalization) and **Planning** (allocation/wave building) responsibilities within the `Outbound module` and execute planning via horizontally-scalable workers.|Improves modularity and scalability at the hotspot without introducing distributed-service complexity; planning throughput can scale independently from ingestion, supporting **QA-01** and keeping boundaries manageable (**AC-02**).|Single monolithic outbound workflow component for both ingestion and planning (harder to scale and evolve).|
+|QA-04, US-04|Make **reservation-based allocation** the correctness boundary during planning: allocation commits `InventoryReservation` and related ledger/balance updates atomically with allocation artifacts.|Prevents double allocation under concurrent planning/retries; leverages inventory invariants and auditability foundation from Iteration 2 to preserve **QA-04** during high-throughput allocation.|Allocating by directly decrementing availability in outbound tables without inventory postings (inconsistent source of truth and weaker auditability).|
+|QA-04, QA-01, US-04|Emit `allocation created` and `wave released` as **transactional outbox events** tied to committed planning state.|Ensures downstream systems and workers see only committed planning outcomes (**QA-04**) while enabling asynchronous fan-out and scaling (**QA-01**).|Direct bus publish inside planning transaction without outbox (risk of lost/duplicated events).|
