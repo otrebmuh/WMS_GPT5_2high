@@ -489,6 +489,73 @@ flowchart LR
 | `Identity provider` | Centralized identity service used by all instances; provides authentication tokens and identity lifecycle. |
 | `Central observability` | Centralized logs/metrics/traces collection with strict per-instance partitioning for supportability. |
 
+#### Disconnected operations topology (Iteration 6)
+This refinement introduces a **warehouse edge node** that can continue a constrained subset of operations when WAN connectivity to the cloud is lost (QA-03). The edge records operations durably and synchronizes with the cloud `WMSInstance` after reconnect using resumable checkpoints and idempotency (QA-04, AC-03, AC-05, C-06).
+
+```mermaid
+flowchart LR
+  User[Warehouse users]
+  Auto[Warehouse automation systems]
+
+  subgraph Site[Warehouse site]
+    EdgeGW[Edge gateway]
+    EdgeCore[Edge operations core]
+    EdgeDB[Edge operational store]
+    EdgeIdem[Edge idempotency store]
+    EdgeOut[Edge outbox]
+    Sync[Sync agent]
+  end
+
+  subgraph Shared[Shared platform services]
+    IdP[Identity provider]
+    Obs[Central observability]
+  end
+
+  subgraph Instance[WMSInstance isolated deployment]
+    GW[API gateway]
+    Core[WMS core application]
+    Int[Integration gateway]
+    Bus[Event bus]
+    DB[WMS operational database]
+    Idem[Idempotency and dedup store]
+    Outbox[Outbox publisher]
+  end
+
+  User -->|Local UI and APIs| EdgeGW
+  Auto <--> |Local automation APIs| EdgeGW
+
+  EdgeGW --> EdgeCore
+  EdgeCore --> EdgeDB
+  EdgeCore --> EdgeOut
+  EdgeGW --> EdgeIdem
+
+  Sync <--> |Resumable sync and checkpoints| EdgeDB
+  Sync -->|Sync operations to cloud| Int
+  Sync -->|Sync operations to cloud| Core
+  Sync -->|Sync operations to cloud| DB
+  Sync -->|Sync dedup and outcomes| Idem
+
+  Core -->|AuthN| IdP
+  Int -->|AuthN| IdP
+  EdgeCore -->|AuthN cache and validation| IdP
+
+  EdgeCore -->|Logs metrics traces| Obs
+  Core -->|Logs metrics traces| Obs
+  Int -->|Logs metrics traces| Obs
+  Bus -->|Metrics| Obs
+  DB -->|Metrics| Obs
+  EdgeDB -->|Metrics| Obs
+```
+
+| Container | Responsibilities |
+|---|---|
+| `Edge gateway` | Local stable entry point for warehouse users and automation during WAN outages; enforces TLS on the local network, validates identity tokens, and routes to `Edge operations core`. |
+| `Edge operations core` | Constrained subset of WMS workflows required to keep warehouse execution running during outage (e.g., pick confirmations, task progress, shipping confirmations as configured); writes a durable operational log and updates local projections. |
+| `Edge operational store` | Durable local store for offline operation records, local projections, and synchronization checkpoints; supports replay and reconciliation after reconnect. |
+| `Edge idempotency store` | Local idempotency/dedup outcomes for edge-facing APIs to prevent duplicate effects under retries and intermittent automation connectivity (C-06, QA-04). |
+| `Edge outbox` | Transactional outbox for operations/events that must be synchronized to the cloud instance; provides durable “to be synced” intent. |
+| `Sync agent` | Bi-directional store-and-forward synchronization component that resumes from checkpoints, batches operations, applies backpressure, and coordinates acknowledgements with cloud idempotency/dedup to ensure no loss and no duplicates (QA-03, QA-04). |
+
 ### 6.- Component diagrams
 The following component view refines the `WMS core application` into **bounded modules**. These are logical components intended to minimize coupling and enable future extraction if needed.
 
@@ -865,6 +932,78 @@ sequenceDiagram
   Int->>Idem: Record outcome for dedup key
 ```
 
+#### Sequence 13: Offline pick confirmation recorded at the edge (Iteration 6)
+This sequence shows a pick confirmation being recorded locally during a WAN outage with **durable logging** and **idempotency**, then synchronized to the cloud instance after reconnect without duplicate inventory effects (QA-03, QA-04).
+
+```mermaid
+sequenceDiagram
+  participant Auto as Automation system
+  participant EdgeGW as Edge gateway
+  participant EdgeIdem as Edge idempotency store
+  participant EdgeCore as Edge operations core
+  participant EdgeDB as Edge operational store
+  participant EdgeOut as Edge outbox
+  participant Sync as Sync agent
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
+  participant Core as WMS core
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  Auto->>EdgeGW: Confirm picks with idempotency key
+  EdgeGW->>EdgeIdem: Check idempotency key
+  EdgeIdem-->>EdgeGW: Not processed
+  EdgeGW->>EdgeCore: Record pick confirmation command
+  EdgeCore->>EdgeDB: Append offline operation record
+  EdgeCore->>EdgeDB: Append InventoryLedgerEntry and update InventoryBalance projection
+  EdgeCore->>EdgeOut: Write outbox record pending sync
+  EdgeCore-->>EdgeGW: Confirmation recorded locally
+  EdgeGW->>EdgeIdem: Record outcome for idempotency key
+  EdgeGW-->>Auto: 200 OK with confirmation reference
+
+  Sync->>EdgeDB: Read pending operations since last checkpoint
+  Sync->>Int: Send operation batch with checkpoint and operation ids
+  Int->>Idem: Check dedup for operation ids
+  Idem-->>Int: Not processed
+  Int->>Core: Apply pick confirmation command
+  Core->>DB: Persist pick confirmation and audit event
+  Core->>DB: Consume reservations and append InventoryLedgerEntry
+  Core->>DB: Update InventoryBalance projection
+  Core->>DB: Write outbox record
+  Core-->>Int: Applied
+  Int->>Idem: Record outcome for operation ids
+  Int-->>Sync: Acknowledge batch and new checkpoint
+  Sync->>EdgeDB: Mark operations synchronized and advance checkpoint
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish pick confirmed event
+```
+
+#### Sequence 14: Reconnect synchronization completes with resumable checkpoints (Iteration 6)
+This sequence shows the sync agent resuming from a known checkpoint after reconnect, applying backpressure and batching so synchronization completes quickly while preserving idempotency and traceability (QA-03, QA-04).
+
+```mermaid
+sequenceDiagram
+  participant Sync as Sync agent
+  participant EdgeDB as Edge operational store
+  participant Int as Integration gateway
+  participant Idem as Idempotency store
+  participant Core as WMS core
+  participant DB as WMS database
+
+  Sync->>EdgeDB: Load last acknowledged checkpoint
+  loop Until edge backlog is empty
+    Sync->>EdgeDB: Read next batch of operations
+    Sync->>Int: Submit batch with checkpoint and operation ids
+    Int->>Idem: Dedup check for batch
+    Idem-->>Int: Not processed or partially processed
+    Int->>Core: Apply operations idempotently
+    Core->>DB: Commit resulting state and outbox
+    Int-->>Sync: Ack applied operations and next checkpoint
+    Sync->>EdgeDB: Mark applied and persist next checkpoint
+  end
+```
+
 
 
 ### 8.- Interfaces
@@ -878,6 +1017,8 @@ This section lists the primary interface shapes established in Iteration 1. Deta
 | Shipping operational API | REST | Confirm shipment endpoint for warehouse users. Requires an idempotency key so retries or double-submits return the same outcome without duplicating shipment confirmation or downstream messages (Iteration 5). |
 | Instance routing | HTTP | Each request is routed to a specific `WMSInstance` deployment using an instance identifier and authorization scope. |
 | Inventory operational API | REST | Inventory queries and inventory-affecting commands (receive, reserve, release, status change, adjust). Inventory-affecting commands must be idempotent (QA-04). |
+| Edge operational API | REST | Local-only operational API exposed by the warehouse edge node for offline-safe commands and queries. Requires idempotency keys and stable correlation identifiers; designed for intermittent warehouse connectivity (QA-03, QA-04, C-06). |
+| Edge synchronization interface | HTTPS | Bi-directional, resumable synchronization between `Sync agent` and cloud `WMSInstance` components using mutual TLS, checkpoints, batching, and deduplication of operation ids to ensure no loss and no duplicates during reconnect (QA-03, QA-04, AC-03, AC-05). |
 
 ### 9.- Design decisions
 The following design decisions were made during the ADD iterations to satisfy the selected drivers.
@@ -908,3 +1049,8 @@ The following design decisions were made during the ADD iterations to satisfy th
 |QA-06, C-04, C-05, AC-03, US-09, US-10|Deliver store confirmations and financial shipment events through the **Integration gateway** consuming the event bus, with anti-corruption mapping per target system.|Centralizes protocol adaptation and contract governance at the boundary; keeps the core domain stable while meeting external integration requirements (**QA-06**, **C-04**, **C-05**) and strengthening integration resilience (**AC-03**).|Embedding store/finance adapters inside core outbound logic (tighter coupling); direct point-to-point core calls to external systems (lower resilience, harder evolution).|
 |QA-04, AC-03, US-09, US-10|Use `IntegrationMessage` as a durable delivery record for outbound store/finance deliveries with explicit state transitions and replay controls.|Provides traceability and operational control for retries/backoff and recovery; supports safe reprocessing without duplicating downstream effects (**QA-04**) and improves integration operability (**AC-03**).|Fire-and-forget publishing with no delivery state (poor recovery); relying on logs only (high operational risk).|
 |QA-04, AC-03, US-08, US-09, US-10|Enforce **idempotency/dedup** for shipment confirmation and per-target outbound deliveries using idempotency keys and recorded outcomes in the idempotency store.|Ensures retries (UI double-submit, transient failures, replays) do not create duplicate confirmations or financial postings; provides “same request, same outcome” semantics across boundaries (**QA-04**, **AC-03**).|Attempting exactly-once delivery “over the wire” (unrealistic); best-effort retries without dedup (duplicate store confirmations/invoices risk).|
+|QA-03, QA-04, C-06, AC-03, AC-05|Introduce a **warehouse edge node** (`Edge gateway`, `Edge operations core`) to support **disconnected operations** with local APIs for users and automation, and later synchronization to the cloud instance.|Meets the requirement to continue operations for up to **3 hours** during WAN outage with controlled scope, while maintaining integration resilience and consistency reasoning across boundaries (**QA-03**, **QA-04**, **AC-03**, **AC-05**).|Cloud-only operation (cannot meet QA-03); offline capability implemented independently in each handheld/client (high inconsistency and governance risk).|
+|QA-03, QA-04, AC-05|Adopt a durable **edge operational store** with an **append-only offline operation record** and local projections (ledger/balance), enabling replay and verification during reconciliation.|Ensures **zero data loss** and provides a deterministic basis for reconciliation and audit across disconnect/reconnect cycles; aligns with the existing ledger-based correctness approach (**QA-04**, **AC-05**) while meeting offline continuity (**QA-03**).|Snapshot-only synchronization without operation journal (hard to prove completeness/no duplicates); multi-master database replication (high conflict risk for inventory semantics).|
+|QA-03, QA-04, AC-03, AC-05|Introduce a **Sync agent** using **resumable checkpoints** and batched submissions of operation ids to cloud components with deduplication and acknowledgements.|Enables predictable catch-up within the recovery window (targeting the “sync within 30 minutes” requirement) and prevents duplicate effects during reconnect storms via checkpointing and idempotency (**QA-03**, **QA-04**).|Manual export/import reconciliation (slow and error-prone); “best-effort” replay without checkpoints (risk of gaps/duplicates).|
+|QA-04, C-06|Require **idempotency keys** for the `Edge operational API` and maintain outcomes in an **Edge idempotency store** for edge-facing operations and automation connectivity retries.|Prevents duplicate local effects under intermittent automation connectivity and retried client requests, preserving inventory integrity during outages (**QA-04**, **C-06**).|Relying on exactly-once transport guarantees (unrealistic across heterogeneous warehouse systems); retries without recorded outcomes (duplicate postings risk).|
+|QA-03, QA-04, AC-03|Define an explicit **Edge synchronization interface** (mutual TLS, checkpoints, batching, dedup of operation ids) between the edge and the cloud instance integration boundary.|Makes the reconnect contract explicit and secure, and ensures synchronization is resumable and idempotent to meet “no loss, no duplicates” objectives (**QA-03**, **QA-04**) while preserving integration boundary principles (**AC-03**).|Ad-hoc database access from edge to cloud DB (security/operational risk); per-operation point-to-point sync without batching/backpressure (poor recovery performance).|
