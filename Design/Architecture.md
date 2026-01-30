@@ -1,5 +1,19 @@
+# WMS Architecture
 ### 1.- Introduction
-<!-- Create a description of the document -->
+This document describes the target architecture for a **cloud-native Warehouse Management System (WMS)** deployed as a fleet of **independently operated `WMSInstance`s** (one per warehouse or region). It captures the architectural structure, key quality attribute drivers, and the major design decisions that shape how the system achieves scalability, reliability, security, and operational governance.
+
+The scope of the views in this document is primarily **one `WMSInstance`** and its interactions with external systems (store systems, corporate financial system, and warehouse automation). Where required by constraints (e.g., shared identity and observability), the document also includes **shared platform services**, while maintaining strict **instance isolation** as a first-order architectural principle.
+
+This architecture is produced using **Attribute-Driven Design (ADD)** and evolves iteratively. Each iteration selects a goal and drivers, refines one or more elements, instantiates concepts into views (diagrams, responsibilities, and interfaces), and records decisions. Use this document as:
+- A **blueprint** for implementation teams to understand boundaries, responsibilities, and integration patterns
+- A **decision log** to preserve rationale and rejected alternatives
+- A **communication artifact** for stakeholders to review how the design addresses the prioritized drivers
+
+Document organization:
+- **Sections 2–6** provide context, drivers, the domain model, and container/component decomposition.
+- **Section 7** provides sequence diagrams that define collaboration and transaction boundaries for key flows.
+- **Section 8** summarizes key interface shapes and cross-cutting expectations (e.g., idempotency and traceability).
+- **Section 9** records the design decisions per ADD iteration and their rationale.
 
 ### 2.- Context diagram
 This diagram shows the system-in-context for a **single `WMSInstance`** (warehouse-scoped deployment) and its primary external interactions. The key architectural intent for Iteration 1 is to establish **instance isolation** (each warehouse instance operates independently) and **decoupled integrations** (stable APIs and/or event streams) so external systems can evolve without changing core WMS domain logic.
@@ -441,6 +455,7 @@ flowchart LR
 
   subgraph Shared[Shared platform services]
     IdP[Identity provider]
+    KMS[Key management service]
     Obs[Central observability]
   end
 
@@ -471,6 +486,8 @@ flowchart LR
 
   Core -->|AuthN| IdP
   Int -->|AuthN| IdP
+  DB -->|Encrypt at rest keys| KMS
+  Idem -->|Encrypt at rest keys| KMS
   Core -->|Logs metrics traces| Obs
   Int -->|Logs metrics traces| Obs
   Bus -->|Metrics| Obs
@@ -479,14 +496,15 @@ flowchart LR
 
 | Container | Responsibilities |
 |---|---|
-| `API gateway` | Stable entry point; routes traffic to the correct `WMSInstance` deployment; enforces TLS, authentication integration, and coarse rate limits. |
-| `WMS core application` | Modular monolith containing the core WMS domain and workflows for inbound, inventory, outbound, counting, tasking, configuration, and audit. Owns the source of truth for warehouse operational data. |
-| `Integration gateway` | Anti-corruption layer for store, financial, and automation systems; protocol adaptation; contract versioning; idempotency enforcement; transforms external messages into internal commands/events. |
+| `API gateway` | Stable entry point; routes traffic to the correct `WMSInstance` deployment; enforces TLS, validates short-lived identity tokens, applies coarse authorization gates and rate limits, and propagates correlation identifiers for traceability. |
+| `WMS core application` | Modular monolith containing the core WMS domain and workflows for inbound, inventory, outbound, counting, tasking, configuration, approvals, and audit. Owns the source of truth for warehouse operational data and enforces policy-based authorization at command boundaries. |
+| `Integration gateway` | Anti-corruption layer for store, financial, and automation systems; protocol adaptation; contract versioning; idempotency enforcement; transforms external messages into internal commands/events; enforces system-to-system authentication and maintains durable `IntegrationMessage` trace for governance. |
 | `Event bus` | Managed pub/sub fabric for decoupled integrations; enables event-driven fan-out and asynchronous processing per instance. |
-| `WMS operational database` | Primary per-instance datastore for core operational entities, configuration, and audit trails. |
+| `WMS operational database` | Primary per-instance datastore for core operational entities, configuration, and immutable audit trails (ledger + audit events); encrypted at rest using managed keys. |
 | `Idempotency and dedup store` | Stores idempotency keys and processing outcomes for external requests/messages to prevent duplicate effects under retries/failures. |
 | `Outbox publisher` | Transactional outbox publisher that reliably emits integration events from committed database changes to the event bus. |
 | `Identity provider` | Centralized identity service used by all instances; provides authentication tokens and identity lifecycle. |
+| `Key management service` | Managed key service used for encryption at rest and key rotation; provides auditable key usage and supports per-instance key isolation. |
 | `Central observability` | Centralized logs/metrics/traces collection with strict per-instance partitioning for supportability. |
 
 #### Disconnected operations topology (Iteration 6)
@@ -1134,6 +1152,123 @@ sequenceDiagram
 
 
 
+#### Sequence 17: Cycle count reconciliation with approvals and auditable postings (Iteration 8)
+This sequence shows a cycle count leading to an adjustment with reason code and optional approval, posted through the inventory ledger with immutable audit events (US-11, US-18, QA-04, QA-07).
+
+```mermaid
+sequenceDiagram
+  participant User as Inventory manager
+  participant Approver as Supervisor
+  participant GW as API gateway
+  participant Core as WMS core
+  participant Sec as Authorization module
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  User->>GW: Start cycle count
+  GW->>Core: Route to instance counting API
+  Core->>Sec: Authorize StartCount scoped to instance and warehouse
+  Sec-->>Core: Allowed
+  Core->>DB: Create InventoryCount status InProgress
+  Core->>DB: Persist AuditEvent
+  Core-->>User: Count created
+
+  User->>GW: Submit count lines
+  GW->>Core: Record count lines
+  Core->>Sec: Authorize RecordCount
+  Sec-->>Core: Allowed
+  Core->>DB: Persist CountLine entries
+  Core->>DB: Persist AuditEvent
+  Core-->>User: Lines recorded
+
+  Core->>DB: Compute discrepancies and draft InventoryAdjustment with ReasonCode
+  alt Adjustment requires approval
+    Core->>DB: Create Approval status Pending
+    Core->>DB: Persist AuditEvent
+    Core-->>User: Adjustment pending approval
+
+    Approver->>GW: Approve adjustment
+    GW->>Core: Route to approval API
+    Core->>Sec: Authorize ApproveAdjustment
+    Sec-->>Core: Allowed
+    Core->>DB: Mark Approval Approved
+    Core->>DB: Append InventoryLedgerEntry for adjustment posting
+    Core->>DB: Update InventoryBalance projection
+    Core->>DB: Persist AuditEvent
+    Core->>DB: Write outbox record inventory adjusted
+    Core-->>Approver: Approved and posted
+  else No approval required
+    Core->>DB: Append InventoryLedgerEntry for adjustment posting
+    Core->>DB: Update InventoryBalance projection
+    Core->>DB: Persist AuditEvent
+    Core->>DB: Write outbox record inventory adjusted
+    Core-->>User: Adjustment posted
+  end
+
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish inventory adjusted event
+```
+
+#### Sequence 18: Warehouse configuration and role changes with audit trail (Iteration 8)
+This sequence shows warehouse-specific configuration or role assignment updates being authorized, versioned, and audited for governance (US-13, QA-07, C-07, AC-08).
+
+```mermaid
+sequenceDiagram
+  participant User as Operations manager
+  participant GW as API gateway
+  participant Core as WMS core
+  participant Sec as Authorization module
+  participant DB as WMS database
+  participant Out as Outbox publisher
+  participant Bus as Event bus
+
+  User->>GW: Update configuration or role assignment
+  GW->>Core: Route to instance configuration API
+  Core->>Sec: Authorize ConfigChange or RoleAdmin
+  Sec-->>Core: Allowed
+  Core->>DB: Persist configuration change with version and effective scope
+  Core->>DB: Persist AuditEvent
+  Core->>DB: Write outbox record config changed
+  Core-->>User: Change accepted
+
+  Out->>DB: Poll pending outbox
+  Out->>Bus: Publish config changed event
+```
+
+#### Sequence 19: Recall blocking prevents allocation and shipment (Iteration 8)
+This sequence shows a recall or return control action blocking inventory via status governance so planning and execution cannot allocate or ship non-eligible stock (US-19, QA-04, QA-07).
+
+```mermaid
+sequenceDiagram
+  participant User as Inventory manager
+  participant GW as API gateway
+  participant Core as WMS core
+  participant Sec as Authorization module
+  participant DB as WMS database
+  participant Plan as Planning worker
+
+  User->>GW: Block inventory for recall
+  GW->>Core: Route to instance inventory API
+  Core->>Sec: Authorize StatusChange or RecallControl
+  Sec-->>Core: Allowed
+  Core->>DB: Append InventoryLedgerEntry for status transfer to quarantined
+  Core->>DB: Update InventoryBalance projection
+  Core->>DB: Persist AuditEvent
+  Core-->>User: Recall block recorded
+
+  Plan->>Core: Allocate inventory for outbound demand
+  Core->>DB: Validate allocation eligibility by InventoryStatus
+  alt Eligible stock exists
+    Core->>DB: Commit InventoryReservation and ledger postings
+    Core->>DB: Persist AuditEvent
+    Plan-->>Core: Allocation succeeded
+  else Only blocked stock available
+    Core->>DB: Persist AuditEvent allocation blocked by status
+    Plan-->>Core: Allocation rejected
+  end
+```
+
 ### 8.- Interfaces
 This section lists the primary interface shapes established in Iteration 1. Detailed contracts and schemas will be refined in later iterations.
 
@@ -1190,3 +1325,10 @@ The following design decisions were made during the ADD iterations to satisfy th
 |QA-10, QA-08, C-03|Use a **GitOps-based progressive delivery control plane** to target subsets of instances, gate promotions, and enable rapid rollback.|Enables safe change across a fleet: selected-instance rollouts and quick rollback reduce release risk and avoid cross-instance downtime (**QA-10**) while keeping instance cells independent (**QA-08**) and sharing only the control plane (**C-03**).|Manual per-instance deployments (error-prone); big-bang fleet upgrades (high risk); rolling updates without gates (harder rollback safety).|
 |QA-02, QA-08|Define **per-instance DR failover procedures** (replica promotion, dependency restoration, routing switch) as an orchestrated, repeatable runbook.|Achieves predictable recovery within RTO/RPO targets (**QA-02**) while allowing failover to be executed for a single affected instance without impacting others (**QA-08**).|Ad-hoc manual failover (slow, error-prone); always-on active-active multi-region for all instances (complex, expensive, harder correctness).|
 |QA-09, AC-07, C-03|Standardize **end-to-end observability telemetry** with required dimensions (`instanceId`, `correlationId`, `integrationTarget`) and central aggregation with per-instance partitioning.|Improves MTTR and operational clarity for order/integration flows (**QA-09**, **AC-07**) while enabling shared tooling without violating instance isolation (**C-03**).|Logs-only troubleshooting (slow); per-instance isolated observability stacks (fragmented and costly).|
+|QA-07, C-07, AC-06|Centralize authentication in a shared IdP using OIDC/OAuth2 with short-lived tokens, and enforce **instance-scoped authorization** (role and warehouse scope) in the `Authorization module` and at the `API gateway` boundary.|Provides strong AuthN while ensuring access decisions remain within the instance isolation boundary; supports least-privilege access and reduces risk of cross-warehouse access (**QA-07**, **AC-06**, **C-07**).|Per-instance identity stores (high ops overhead and inconsistent governance); long-lived API keys only (weak governance and rotation risk).|
+|QA-07, C-07|Adopt **defense-in-depth** ingress security: TLS everywhere, token validation at `API gateway`, coarse authorization gates, and propagation of correlation identifiers for traceability.|Reduces attack surface, blocks unauthenticated/unauthorized access early, and ensures audit/trace correlation for sensitive inventory operations (**QA-07**, **US-18**).|Application-only enforcement with a pass-through gateway (inconsistent controls and larger blast radius).|
+|QA-07, C-07|Encrypt sensitive operational data at rest using a managed **key management service** with auditable key use and rotation, applied to per-instance `WMS operational database` and `Idempotency and dedup store`.|Meets corporate security policy expectations and provides clear, auditable controls for encryption-at-rest while preserving per-instance isolation via scoped key policies (**QA-07**, **C-07**).|Single shared encryption key for all instances (weak isolation); application-managed keys (high operational risk).|
+|US-18, QA-04, QA-07|Strengthen auditability by recording all inventory-affecting operations as immutable `InventoryLedgerEntry` plus `AuditEvent`, and ensure audit/event publication uses the transactional outbox to avoid gaps.|Creates a tamper-resistant and replayable trail for audits and investigations while preventing “state changed but missing audit/event” failure modes (**US-18**, **QA-04**, **QA-07**).|Relying only on mutable audit columns on business tables (weak forensic integrity); relying on centralized logs only (retention and authority limitations).|
+|US-11, US-18, QA-04|Model inventory counting and reconciliation as explicit workflow state: `InventoryCount`, `InventoryAdjustment`, `ReasonCode`, and `Approval`, with posting gated by authorization and approval rules and recorded in the ledger.|Supports governed adjustments with dual control, standardized reason codes, and auditable postings; reduces fraud/error risk while keeping inventory integrity under retries/failures (**US-11**, **US-18**, **QA-04**).|Direct adjustments without approvals (fast but high governance risk); manual approvals outside the system (non-auditable and inconsistent).|
+|US-13, AC-08, QA-07|Treat warehouse configuration and role changes as **configuration-as-data** with versioning and immutable audit events; optionally publish config-change events for downstream consumers.|Prevents “snowflake” warehouses and supports controlled rollouts/rollback of configuration while providing an audit trail for governance (**US-13**, **AC-08**, **QA-07**).|Divergent code branches per warehouse (high maintenance cost); ad-hoc config edits without versioning/audit (drift and weak governance).|
+|US-19, QA-04, QA-07|Enforce recall and returns controls via **inventory status governance** (block/quarantine) and eligibility checks during allocation and execution, with all status changes ledgered and audited.|Prevents allocation/shipment of non-eligible stock by making status a hard constraint at the inventory boundary; preserves integrity and compliance evidence (**US-19**, **QA-04**, **QA-07**).|Downstream-only checks in outbound/shipping flows (too late and bypassable); informal “do not ship” flags outside inventory core (inconsistent enforcement).|
