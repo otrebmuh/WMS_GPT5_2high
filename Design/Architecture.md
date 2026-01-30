@@ -556,6 +556,85 @@ flowchart LR
 | `Edge outbox` | Transactional outbox for operations/events that must be synchronized to the cloud instance; provides durable “to be synced” intent. |
 | `Sync agent` | Bi-directional store-and-forward synchronization component that resumes from checkpoints, batches operations, applies backpressure, and coordinates acknowledgements with cloud idempotency/dedup to ensure no loss and no duplicates (QA-03, QA-04). |
 
+#### Availability, DR, observability, and progressive delivery topology (Iteration 7)
+This refinement instantiates the Iteration 7 drivers by making **multi-AZ availability** and **operational control** explicit per `WMSInstance`, while keeping **shared platform services** limited to those allowed by C-03. It also introduces a **regional DR posture** aligned with QA-02 (RPO < 15 min, RTO < 4 hours) and a **progressive delivery control plane** aligned with QA-10.
+
+```mermaid
+flowchart LR
+  Ops[Support and ops staff]
+
+  subgraph Shared[Shared platform services]
+    IdP[Identity provider]
+    Obs[Central observability]
+    GitOps[GitOps deployment controller]
+  end
+
+  subgraph Primary[Primary region]
+    subgraph AZA[AZ A]
+      GW_A[API gateway]
+      Core_A[WMS core application]
+      Int_A[Integration gateway]
+      Out_A[Outbox publisher]
+    end
+    subgraph AZB[AZ B]
+      GW_B[API gateway]
+      Core_B[WMS core application]
+      Int_B[Integration gateway]
+      Out_B[Outbox publisher]
+    end
+    BusP[Event bus]
+    DBP[WMS operational database]
+    IdemP[Idempotency and dedup store]
+  end
+
+  subgraph DR[DR region]
+    BusD[Event bus]
+    DBD[WMS operational database]
+    IdemD[Idempotency and dedup store]
+  end
+
+  Ops -->|Rollout target selection and approval| GitOps
+  GitOps -->|Declarative sync per instance cell| GW_A
+  GitOps -->|Declarative sync per instance cell| GW_B
+  GitOps -->|Declarative sync per instance cell| Core_A
+  GitOps -->|Declarative sync per instance cell| Core_B
+  GitOps -->|Declarative sync per instance cell| Int_A
+  GitOps -->|Declarative sync per instance cell| Int_B
+  GitOps -->|Declarative sync per instance cell| Out_A
+  GitOps -->|Declarative sync per instance cell| Out_B
+
+  Core_A --> DBP
+  Core_B --> DBP
+  Int_A --> IdemP
+  Int_B --> IdemP
+  Out_A --> BusP
+  Out_B --> BusP
+
+  Core_A -->|AuthN| IdP
+  Core_B -->|AuthN| IdP
+  Int_A -->|AuthN| IdP
+  Int_B -->|AuthN| IdP
+
+  Core_A -->|Logs metrics traces| Obs
+  Core_B -->|Logs metrics traces| Obs
+  Int_A -->|Logs metrics traces| Obs
+  Int_B -->|Logs metrics traces| Obs
+  BusP -->|Metrics| Obs
+  DBP -->|Metrics| Obs
+
+  DBP -->|Async replication and PITR backups| DBD
+  BusP -->|DR configuration and replay controls| BusD
+  IdemP -->|Replicate or reconstruct from durable inputs| IdemD
+```
+
+| Instantiated element | Responsibilities in Iteration 7 |
+|---|---|
+| `WMSInstance isolated deployment` | Treated as a **cell** spanning multiple AZs with explicit fault boundaries; can be deployed and rolled back independently of other instances (QA-08, QA-10). |
+| `WMS operational database` | Configured for **multi-AZ HA**, automated backups, PITR, and **cross-region replication** to support QA-02 DR targets. |
+| `Event bus` | Operated as a managed service with multi-AZ durability and DR posture; supports operational controls such as replay and retention for recovery. |
+| `Central observability` | Enforces **per-instance partitioning** and provides fleet dashboards and alerts for core flows and integrations (QA-09, AC-07, C-03). |
+| `GitOps deployment controller` | Provides declarative, auditable rollouts with **per-instance targeting** and promotion gates for progressive delivery (QA-10). |
+
 ### 6.- Component diagrams
 The following component view refines the `WMS core application` into **bounded modules**. These are logical components intended to minimize coupling and enable future extraction if needed.
 
@@ -1004,6 +1083,55 @@ sequenceDiagram
   end
 ```
 
+#### Sequence 15: Progressive delivery rollout to a subset of instances (Iteration 7)
+This sequence shows a safe rollout of a new version to a selected subset of instances, using promotion gates backed by centralized observability signals (QA-10, QA-09).
+
+```mermaid
+sequenceDiagram
+  participant Ops as Support and ops staff
+  participant GitOps as GitOps deployment controller
+  participant InstA as WMSInstance A
+  participant InstB as WMSInstance B
+  participant Obs as Central observability
+
+  Ops->>GitOps: Select target instances for rollout
+  GitOps->>InstA: Apply release manifest
+  InstA-->>Obs: Emit health and SLI signals
+  Obs-->>GitOps: Canary evaluation result
+
+  alt Canary fails
+    GitOps->>InstA: Roll back to previous manifest
+    InstA-->>Obs: Emit recovery signals
+  else Canary succeeds
+    GitOps->>InstB: Apply release manifest
+    InstB-->>Obs: Emit health and SLI signals
+    Obs-->>GitOps: Promotion evaluation result
+    GitOps-->>Ops: Rollout complete
+  end
+```
+
+#### Sequence 16: Regional disaster failover for a single instance (Iteration 7)
+This sequence shows a controlled failover of one `WMSInstance` to the DR region, targeting QA-02 RPO/RTO while preserving instance isolation (QA-08).
+
+```mermaid
+sequenceDiagram
+  participant Ops as Support and ops staff
+  participant Orchestrator as DR orchestrator
+  participant DNS as Routing and DNS
+  participant DBP as Primary region database
+  participant DBD as DR region database
+  participant BusD as DR event bus
+  participant InstD as WMSInstance in DR
+
+  Ops->>Orchestrator: Declare incident and start failover
+  Orchestrator->>DBD: Promote replica and enable writes
+  DBP-->>DBD: Replication catches up to last point
+  Orchestrator->>BusD: Ensure integration streams and replay controls
+  Orchestrator->>InstD: Start instance workloads in DR
+  Orchestrator->>DNS: Switch routing to DR instance endpoints
+  InstD-->>Ops: Instance available in DR
+```
+
 
 
 ### 8.- Interfaces
@@ -1019,6 +1147,9 @@ This section lists the primary interface shapes established in Iteration 1. Deta
 | Inventory operational API | REST | Inventory queries and inventory-affecting commands (receive, reserve, release, status change, adjust). Inventory-affecting commands must be idempotent (QA-04). |
 | Edge operational API | REST | Local-only operational API exposed by the warehouse edge node for offline-safe commands and queries. Requires idempotency keys and stable correlation identifiers; designed for intermittent warehouse connectivity (QA-03, QA-04, C-06). |
 | Edge synchronization interface | HTTPS | Bi-directional, resumable synchronization between `Sync agent` and cloud `WMSInstance` components using mutual TLS, checkpoints, batching, and deduplication of operation ids to ensure no loss and no duplicates during reconnect (QA-03, QA-04, AC-03, AC-05). |
+| Observability telemetry | OTLP and vendor APIs | Standardized logs, metrics, and traces emitted with required dimensions such as `instanceId`, `correlationId`, and `integrationTarget` to support fleet troubleshooting and SLO alerting (QA-09, AC-07). |
+| Release management control | GitOps and cluster APIs | Declarative per-instance rollout targeting, promotion gates, and rollback for progressive delivery (QA-10). |
+| DR orchestration | Automation APIs | Interfaces used to promote replicas, restore dependencies, and switch routing per instance to meet QA-02 RPO/RTO goals. |
 
 ### 9.- Design decisions
 The following design decisions were made during the ADD iterations to satisfy the selected drivers.
@@ -1054,3 +1185,8 @@ The following design decisions were made during the ADD iterations to satisfy th
 |QA-03, QA-04, AC-03, AC-05|Introduce a **Sync agent** using **resumable checkpoints** and batched submissions of operation ids to cloud components with deduplication and acknowledgements.|Enables predictable catch-up within the recovery window (targeting the “sync within 30 minutes” requirement) and prevents duplicate effects during reconnect storms via checkpointing and idempotency (**QA-03**, **QA-04**).|Manual export/import reconciliation (slow and error-prone); “best-effort” replay without checkpoints (risk of gaps/duplicates).|
 |QA-04, C-06|Require **idempotency keys** for the `Edge operational API` and maintain outcomes in an **Edge idempotency store** for edge-facing operations and automation connectivity retries.|Prevents duplicate local effects under intermittent automation connectivity and retried client requests, preserving inventory integrity during outages (**QA-04**, **C-06**).|Relying on exactly-once transport guarantees (unrealistic across heterogeneous warehouse systems); retries without recorded outcomes (duplicate postings risk).|
 |QA-03, QA-04, AC-03|Define an explicit **Edge synchronization interface** (mutual TLS, checkpoints, batching, dedup of operation ids) between the edge and the cloud instance integration boundary.|Makes the reconnect contract explicit and secure, and ensures synchronization is resumable and idempotent to meet “no loss, no duplicates” objectives (**QA-03**, **QA-04**) while preserving integration boundary principles (**AC-03**).|Ad-hoc database access from edge to cloud DB (security/operational risk); per-operation point-to-point sync without batching/backpressure (poor recovery performance).|
+|QA-02, QA-08, AC-04, C-03|Run each `WMSInstance` cell as a **multi-AZ deployment** with AZ-spread stateless workloads and explicit readiness and health signaling.|Survives loss of a node or an AZ without interrupting core warehouse operations (**QA-02**) while keeping failures and noisy-neighbor effects isolated to the instance cell (**QA-08**, **AC-04**, **C-03**).|Single-AZ instance deployments (lower cost but fails QA-02); shared multi-tenant runtime spanning many instances (higher cascade risk).|
+|QA-02, C-01, QA-08|Adopt a **managed HA operational database per instance** with automated backups, PITR, and **cross-region replication** to a DR region.|Leverages managed services to reduce ops overhead (**C-01**) while meeting availability and DR objectives (**QA-02**) without coupling multiple instances to a shared datastore (**QA-08**).|Self-managed database on VMs (higher ops burden); backup-only DR without replication (often misses RTO); shared database with tenant partitioning (weaker isolation).|
+|QA-10, QA-08, C-03|Use a **GitOps-based progressive delivery control plane** to target subsets of instances, gate promotions, and enable rapid rollback.|Enables safe change across a fleet: selected-instance rollouts and quick rollback reduce release risk and avoid cross-instance downtime (**QA-10**) while keeping instance cells independent (**QA-08**) and sharing only the control plane (**C-03**).|Manual per-instance deployments (error-prone); big-bang fleet upgrades (high risk); rolling updates without gates (harder rollback safety).|
+|QA-02, QA-08|Define **per-instance DR failover procedures** (replica promotion, dependency restoration, routing switch) as an orchestrated, repeatable runbook.|Achieves predictable recovery within RTO/RPO targets (**QA-02**) while allowing failover to be executed for a single affected instance without impacting others (**QA-08**).|Ad-hoc manual failover (slow, error-prone); always-on active-active multi-region for all instances (complex, expensive, harder correctness).|
+|QA-09, AC-07, C-03|Standardize **end-to-end observability telemetry** with required dimensions (`instanceId`, `correlationId`, `integrationTarget`) and central aggregation with per-instance partitioning.|Improves MTTR and operational clarity for order/integration flows (**QA-09**, **AC-07**) while enabling shared tooling without violating instance isolation (**C-03**).|Logs-only troubleshooting (slow); per-instance isolated observability stacks (fragmented and costly).|
